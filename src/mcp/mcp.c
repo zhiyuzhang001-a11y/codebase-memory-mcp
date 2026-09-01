@@ -469,6 +469,18 @@ static const tool_def_t TOOLS[] = {
      "for wide sweeps where per-row metadata is noise. default: full rows.\"}},"
      "\"required\":[\"project\"]}"},
 
+    {"locate_files", "Locate likely files",
+     "Return at most two repository-relative files likely to contain an implementation for a "
+     "free-form intent. This is a bounded heuristic over the existing structural FTS index, not "
+     "an exact symbol or callable lookup. Read and search the returned files before editing.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"project\":{\"type\":\"string\"},"
+     "\"intent\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":1000},"
+     "\"max_files\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2,\"default\":2},"
+     "\"max_internal_rows\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":60,"
+     "\"default\":60}},\"required\":[\"project\",\"intent\"],"
+     "\"additionalProperties\":false}"},
+
     {"query_graph", "Query graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
      "aggregations, and cross-service analysis. The response includes 'total' (returned "
@@ -742,6 +754,7 @@ typedef struct {
 static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"index_repository", false, false, true, false},
     {"search_graph", false, true, true, false},
+    {"locate_files", false, true, true, false},
     {"query_graph", false, true, true, false},
     {"trace_path", false, true, true, false},
     {"get_code_snippet", false, true, true, false},
@@ -808,13 +821,14 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
 
 static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",    "trace_path",           "get_code_snippet",
+        "search_graph",     "locate_files",   "query_graph",          "trace_path",
+        "get_code_snippet",
         "get_graph_schema", "compare_graphs", "get_architecture",     "search_code",
         "list_projects",    "index_status",   "check_index_coverage", "detect_changes",
     };
     static const char *const scout_tools[] = {
-        "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
-        "list_projects", "index_status", "check_index_coverage",
+        "search_graph",  "locate_files", "trace_path",           "get_code_snippet",
+        "get_architecture", "list_projects", "index_status",      "check_index_coverage",
     };
     if (!name) {
         return false;
@@ -3695,6 +3709,281 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return json;
+}
+
+enum {
+    LOCATE_FILES_DEFAULT_MAX_FILES = 3,
+    LOCATE_FILES_MAX_FILES = 2,
+    LOCATE_FILES_DEFAULT_INTERNAL_ROWS = 60,
+    LOCATE_FILES_MAX_INTERNAL_ROWS = 60,
+    LOCATE_FILES_MAX_INTENT_BYTES = 1000,
+};
+
+static bool locate_file_path_is_safe(const char *path) {
+    if (!path || !path[0] || path[0] == '/' || path[0] == '\\' || path[0] == '<' ||
+        strchr(path, '\\') || strstr(path, "//") || strncmp(path, "./", 2) == 0 ||
+        strstr(path, "/./") || (isalpha((unsigned char)path[0]) && path[1] == ':')) {
+        return false;
+    }
+    const char *segment = path;
+    while (segment && *segment) {
+        const char *end = strchr(segment, '/');
+        size_t length = end ? (size_t)(end - segment) : strlen(segment);
+        if (length == 0 || (length == 2 && segment[0] == '.' && segment[1] == '.')) {
+            return false;
+        }
+        segment = end ? end + 1 : NULL;
+    }
+    return true;
+}
+
+static bool locate_is_stopword(const char *token) {
+    static const char *const words[] = {
+        "a", "an", "and", "as", "at", "be", "before", "by", "for", "from", "in",
+        "into", "is", "it", "no", "of", "on", "one", "or", "only", "the", "their",
+        "this", "to", "when", "while", "with", "without", "whose", "its", "all",
+        "several", "should", "whether", "through",
+    };
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        if (strcmp(token, words[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool locate_match_contains(const char *match, const char *token) {
+    size_t token_len = strlen(token);
+    for (const char *cursor = match; cursor && *cursor;) {
+        const char *end = strstr(cursor, " OR ");
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        if (length == token_len && strncmp(cursor, token, length) == 0) {
+            return true;
+        }
+        cursor = end ? end + 4 : NULL;
+    }
+    return false;
+}
+
+static bool locate_append_term(char *out, size_t out_size, const char *term, int *count) {
+    if (!term[0] || locate_match_contains(out, term)) {
+        return true;
+    }
+    size_t used = strlen(out);
+    size_t separator = *count > 0 ? 4U : 0U;
+    size_t length = strlen(term);
+    if (used + separator + length + 1 > out_size) {
+        return false;
+    }
+    if (separator) {
+        memcpy(out + used, " OR ", separator);
+        used += separator;
+    }
+    memcpy(out + used, term, length + 1);
+    (*count)++;
+    return true;
+}
+
+static void locate_stem(const char *token, char *out, size_t out_size) {
+    static const char *const suffixes[] = {
+        "ization", "ational", "ingly", "ments", "ment", "ation", "ings", "ing",
+        "ies", "ied", "ers", "ed", "es", "s",
+    };
+    snprintf(out, out_size, "%s", token);
+    size_t length = strlen(out);
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t suffix_len = strlen(suffixes[i]);
+        if (length >= suffix_len + 4 && strcmp(out + length - suffix_len, suffixes[i]) == 0) {
+            size_t base_len = length - suffix_len;
+            out[base_len] = '\0';
+            if (strcmp(suffixes[i], "ies") == 0 || strcmp(suffixes[i], "ied") == 0) {
+                if (base_len + 2 <= out_size) {
+                    out[base_len] = 'y';
+                    out[base_len + 1] = '\0';
+                }
+            }
+            return;
+        }
+    }
+}
+
+static int locate_build_match(const char *query, char *out, size_t out_size) {
+    char normalized[BM25_QUERY_BUF];
+    size_t written = 0;
+    unsigned char previous = 0;
+    for (const unsigned char *cursor = (const unsigned char *)query;
+         *cursor && written + 1 < sizeof(normalized); cursor++) {
+        unsigned char current = *cursor;
+        if (isupper(current) && (islower(previous) || isdigit(previous)) && written > 0 &&
+            normalized[written - 1] != ' ') {
+            normalized[written++] = ' ';
+        }
+        normalized[written++] = (char)(isalnum(current) ? tolower(current) : ' ');
+        previous = current;
+    }
+    normalized[written] = '\0';
+    out[0] = '\0';
+    int count = 0;
+    char *cursor = normalized;
+    while (*cursor) {
+        while (*cursor == ' ') {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+        char *end = cursor;
+        while (*end && *end != ' ') {
+            end++;
+        }
+        char saved = *end;
+        *end = '\0';
+        if (strlen(cursor) > 1 && !locate_is_stopword(cursor)) {
+            if (!locate_append_term(out, out_size, cursor, &count)) {
+                break;
+            }
+            char stemmed[BM25_QUERY_BUF];
+            locate_stem(cursor, stemmed, sizeof(stemmed));
+            if (strcmp(stemmed, cursor) != 0 &&
+                !locate_append_term(out, out_size, stemmed, &count)) {
+                break;
+            }
+        }
+        *end = saved;
+        cursor = end;
+    }
+    return count;
+}
+
+static void locate_add_terms(yyjson_mut_doc *doc, yyjson_mut_val *terms, const char *match) {
+    for (const char *cursor = match; cursor && *cursor;) {
+        const char *end = strstr(cursor, " OR ");
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        char term[BM25_QUERY_BUF];
+        if (length >= sizeof(term)) {
+            length = sizeof(term) - 1;
+        }
+        memcpy(term, cursor, length);
+        term[length] = '\0';
+        yyjson_mut_arr_add_strcpy(doc, terms, term);
+        cursor = end ? end + 4 : NULL;
+    }
+}
+
+/* One bounded SQLite statement performs candidate retrieval and unique-file
+ * projection. Atlas consumes this through the Provider tool boundary; it does
+ * not inspect the Provider database. */
+static char *handle_locate_files(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
+    char *intent = cbm_mcp_get_string_arg(args, "intent");
+    int max_files = cbm_mcp_get_int_arg(args, "max_files", LOCATE_FILES_DEFAULT_MAX_FILES);
+    int max_internal_rows = cbm_mcp_get_int_arg(
+        args, "max_internal_rows", LOCATE_FILES_DEFAULT_INTERNAL_ROWS);
+    if (!intent || !intent[0] || strlen(intent) > LOCATE_FILES_MAX_INTENT_BYTES) {
+        free(intent);
+        free(project);
+        return cbm_mcp_text_result("intent must contain 1 to 1000 bytes", true);
+    }
+    if (max_files < 1 || max_files > LOCATE_FILES_MAX_FILES) {
+        free(intent);
+        free(project);
+        return cbm_mcp_text_result("max_files must be between 1 and 2", true);
+    }
+    if (max_internal_rows < 1 || max_internal_rows > LOCATE_FILES_MAX_INTERNAL_ROWS) {
+        free(intent);
+        free(project);
+        return cbm_mcp_text_result("max_internal_rows must be between 1 and 60", true);
+    }
+
+    char fts_query[BM25_QUERY_BUF];
+    if (locate_build_match(intent, fts_query, sizeof(fts_query)) == 0) {
+        free(intent);
+        free(project);
+        return cbm_mcp_text_result("intent must contain a searchable term", true);
+    }
+
+    const char *sql =
+        "WITH candidates AS ("
+        " SELECT rowid, bm25(intent_fts,4.0,2.0,1.5,2.0,2.0,1.0) AS rank"
+        " FROM intent_fts WHERE intent_fts MATCH ?1"
+        " ORDER BY rank, rowid LIMIT ?3"
+        "), projected AS ("
+        " SELECT n.file_path, c.rank, n.id,"
+        " COUNT(*) OVER (PARTITION BY n.file_path) AS evidence_count,"
+        " ROW_NUMBER() OVER (PARTITION BY n.file_path ORDER BY c.rank,n.id) AS file_row"
+        " FROM candidates c JOIN nodes n ON n.id = c.rowid WHERE n.project = ?2"
+        ")"
+        " SELECT file_path, rank, evidence_count FROM projected WHERE file_row = 1"
+        " ORDER BY rank, id LIMIT ?4";
+
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *stmt = NULL;
+    if (!db || sqlite3_prepare_v2(db, sql, BM25_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        free(intent);
+        free(project);
+        return cbm_mcp_text_result("bounded file retrieval is unavailable", true);
+    }
+    sqlite3_bind_text(stmt, 1, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, max_internal_rows);
+    sqlite3_bind_int(stmt, 4, max_files);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    bool unsafe_path = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *path = (const char *)sqlite3_column_text(stmt, 0);
+        if (!locate_file_path_is_safe(path)) {
+            unsafe_path = true;
+            break;
+        }
+        yyjson_mut_val *file = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, file, "path", path);
+        yyjson_mut_obj_add_real(doc, file, "rank", sqlite3_column_double(stmt, 1));
+        yyjson_mut_obj_add_int(doc, file, "evidence_count", sqlite3_column_int(stmt, 2));
+        yyjson_mut_arr_add_val(files, file);
+    }
+    sqlite3_finalize(stmt);
+    if (unsafe_path) {
+        yyjson_mut_doc_free(doc);
+        free(intent);
+        free(project);
+        return cbm_mcp_text_result("indexed file path is not repository-relative", true);
+    }
+
+    yyjson_mut_obj_add_str(doc, root, "status",
+                           yyjson_mut_arr_size(files) > 0 ? "ok" : "no_matches");
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project);
+    yyjson_mut_obj_add_bool(doc, root, "heuristic", true);
+    yyjson_mut_obj_add_bool(doc, root, "non_exhaustive", true);
+    yyjson_mut_obj_add_val(doc, root, "files", files);
+    yyjson_mut_val *terms = yyjson_mut_arr(doc);
+    locate_add_terms(doc, terms, fts_query);
+    yyjson_mut_obj_add_val(doc, root, "matched_terms", terms);
+    yyjson_mut_val *budget = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, budget, "provider_queries", 1);
+    yyjson_mut_obj_add_int(doc, budget, "max_internal_rows", max_internal_rows);
+    yyjson_mut_obj_add_int(doc, budget, "max_files", max_files);
+    yyjson_mut_obj_add_val(doc, root, "budget", budget);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(intent);
+    free(project);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
 }
 
 /* Extract keyword strings from a yyjson array into `keywords`.  Returns the
@@ -12334,6 +12623,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "search_graph") == 0) {
         return handle_search_graph(srv, args_json);
+    }
+    if (strcmp(tool_name, "locate_files") == 0) {
+        return handle_locate_files(srv, args_json);
     }
     if (strcmp(tool_name, "query_graph") == 0) {
         return handle_query_graph(srv, args_json);

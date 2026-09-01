@@ -379,6 +379,23 @@ static int init_schema(cbm_store_t *s) {
             sqlite3_free(fts_err);
         }
     }
+    /* M36 opt-in file-location surface. This is separate from nodes_fts so the
+     * existing exact/natural-language search contract and its weights cannot
+     * drift. Older binaries ignore this contentless table; prototype rollback
+     * data can therefore be discarded without touching source or old indexes. */
+    {
+        char *intent_err = NULL;
+        int intent_rc = sqlite3_exec(
+            s->db,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS intent_fts USING fts5("
+            "  name, path, signature, docstring, owner, body,"
+            "  content='', tokenize='unicode61 remove_diacritics 2'"
+            ");",
+            NULL, NULL, &intent_err);
+        if (intent_rc != SQLITE_OK && intent_err) {
+            sqlite3_free(intent_err);
+        }
+    }
     return CBM_STORE_OK;
 }
 
@@ -451,9 +468,15 @@ int cbm_store_fts_rebuild(cbm_store_t *s, const char *project, int64_t after_id)
         return CBM_STORE_ERR;
     }
     /* Wholesale only: the incremental caller adds rows to a live index. */
-    if (!project &&
-        exec_sql(s, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") != CBM_STORE_OK) {
-        return CBM_STORE_ERR;
+    if (!project) {
+        if (exec_sql(s, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") !=
+            CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+        if (exec_sql(s, "INSERT INTO intent_fts(intent_fts) VALUES('delete-all');") !=
+            CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
     }
     /* Degrade one capability at a time, widest first.  Dropping `body` covers a
      * legacy four-column table or a build without JSON1; dropping
@@ -472,9 +495,48 @@ int cbm_store_fts_rebuild(cbm_store_t *s, const char *project, int64_t after_id)
         }
         rc = fts_backfill_try(s, project, after_id, ladder[i].body, ladder[i].camel);
         if (rc == CBM_STORE_OK) {
-            return rc;
+            break;
         }
     }
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    const char *intent_sql =
+        "INSERT INTO intent_fts(rowid,name,path,signature,docstring,owner,body)"
+        " SELECT id,"
+        " cbm_camel_split(name), cbm_camel_split(file_path),"
+        " cbm_camel_split(CASE WHEN json_valid(properties)"
+        "   THEN COALESCE(json_extract(properties,'$.signature'),'') ELSE '' END),"
+        " cbm_camel_split(CASE WHEN json_valid(properties)"
+        "   THEN COALESCE(json_extract(properties,'$.docstring'),'') ELSE '' END),"
+        " cbm_camel_split(CASE WHEN json_valid(properties)"
+        "   THEN COALESCE(json_extract(properties,'$.parent_class'),'') ELSE '' END),"
+        " cbm_camel_split(CASE WHEN json_valid(properties)"
+        "   THEN COALESCE(json_extract(properties,'$.bt'),'') ELSE '' END)"
+        " FROM nodes WHERE label IN ('Function','Method')"
+        " AND file_path IS NOT NULL AND file_path != ''"
+        " AND (CASE WHEN json_valid(properties)"
+        "   THEN COALESCE(json_extract(properties,'$.is_test'),0) ELSE 0 END) != 1"
+        " AND file_path NOT LIKE '%_test.go' AND file_path NOT LIKE '%/test/%'"
+        " AND file_path NOT LIKE 'vendor/%' AND file_path NOT LIKE '%/vendor/%'"
+        " AND (?1 IS NULL OR (project = ?1 AND id > ?2));";
+    sqlite3_stmt *intent_stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, intent_sql, CBM_NOT_FOUND, &intent_stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (project) {
+        sqlite3_bind_text(intent_stmt, ST_COL_1, project, CBM_NOT_FOUND, BIND_TRANSIENT);
+        sqlite3_bind_int64(intent_stmt, ST_COL_2, after_id);
+    } else {
+        sqlite3_bind_null(intent_stmt, ST_COL_1);
+        sqlite3_bind_int64(intent_stmt, ST_COL_2, 0);
+    }
+    rc = sqlite3_step(intent_stmt) == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+    if (rc != CBM_STORE_OK) {
+        store_set_error_sqlite(s, "intent_fts_backfill");
+    }
+    sqlite3_finalize(intent_stmt);
     return rc;
 }
 

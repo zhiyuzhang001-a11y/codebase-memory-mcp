@@ -848,6 +848,7 @@ TEST(mcp_tools_list) {
     /* Should contain all tools, including the targeted coverage gate. */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
+    ASSERT_NOT_NULL(strstr(json, "locate_files"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
     ASSERT_NOT_NULL(strstr(json, "trace_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code_snippet"));
@@ -936,6 +937,7 @@ TEST(mcp_tools_have_behavior_annotations) {
          * recovery quarantines/removes database files. Keep the annotations
          * conservative until query resolution is strictly non-mutating. */
         {"search_graph", false, true, true, false},
+        {"locate_files", false, true, true, false},
         {"query_graph", false, true, true, false},
         {"trace_path", false, true, true, false},
         {"get_code_snippet", false, true, true, false},
@@ -1436,7 +1438,7 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
 
     resp = cbm_mcp_server_handle(
         srv,
-        "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"8\"}}");
+        "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"9\"}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
     ASSERT_NULL(strstr(resp, "\"nextCursor\""));
@@ -1463,7 +1465,8 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":220,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",    "trace_path",           "get_code_snippet",
+        "search_graph",     "locate_files",   "query_graph",          "trace_path",
+        "get_code_snippet",
         "get_graph_schema", "compare_graphs", "get_architecture",     "search_code",
         "list_projects",    "index_status",   "check_index_coverage", "detect_changes",
     };
@@ -1504,8 +1507,9 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
 
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_EQ(mcp_response_tool_count(resp), 7U);
+    ASSERT_EQ(mcp_response_tool_count(resp), 8U);
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "search_graph"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "locate_files"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "trace_path"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_code_snippet"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_architecture"));
@@ -13275,6 +13279,92 @@ static char *prose_search(cbm_mcp_server_t *srv, const char *proj, const char *q
     return inner;
 }
 
+static char *locate_files_search(cbm_mcp_server_t *srv, const char *proj, const char *intent,
+                                 int max_files, int max_internal_rows) {
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":536,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"locate_files\","
+             "\"arguments\":{\"project\":\"%s\",\"intent\":\"%s\","
+             "\"max_files\":%d,\"max_internal_rows\":%d}}}",
+             proj, intent, max_files, max_internal_rows);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    if (!resp) {
+        return NULL;
+    }
+    char *inner = extract_text_content(resp);
+    free(resp);
+    return inner;
+}
+
+TEST(locate_files_is_bounded_deterministic_and_file_only) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "locate-files";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/locate-files");
+
+    const char *paths[] = {"src/a.c", "src/b.c", "src/c.c", "src/d.c"};
+    const char *names[] = {"reconcilePrimary", "reconcileSecondary", "reconcileThird",
+                           "reconcileFourth"};
+    for (int i = 0; i < 4; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "locate.%s", names[i]);
+        cbm_node_t fn = {.project = proj,
+                         .label = "Function",
+                         .name = names[i],
+                         .qualified_name = qn,
+                         .file_path = paths[i]};
+        ASSERT_TRUE(cbm_store_upsert_node(st, &fn) > 0);
+    }
+    ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
+
+    char *inner = locate_files_search(srv, proj, "reconcile", 2, 60);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"ok\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"heuristic\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"non_exhaustive\":true"));
+    const char *a = strstr(inner, "src/a.c");
+    const char *b = strstr(inner, "src/b.c");
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+    ASSERT_TRUE(a < b);
+    ASSERT_NULL(strstr(inner, "src/c.c"));
+    ASSERT_NULL(strstr(inner, "src/d.c"));
+    ASSERT_NULL(strstr(inner, "qualified_name"));
+    ASSERT_NULL(strstr(inner, "callable"));
+    ASSERT_NOT_NULL(strstr(inner, "\"provider_queries\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"max_internal_rows\":60"));
+    free(inner);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(locate_files_rejects_unsafe_indexed_paths) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "locate-unsafe";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/locate-unsafe");
+    cbm_node_t fn = {.project = proj,
+                     .label = "Function",
+                     .name = "escapeTarget",
+                     .qualified_name = "locate.escapeTarget",
+                     .file_path = "../outside.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(st, &fn) > 0);
+    ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
+
+    char *inner = locate_files_search(srv, proj, "escape", 2, 60);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "not repository-relative"));
+    ASSERT_NULL(strstr(inner, "../outside.c"));
+    free(inner);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(bm25_finds_section_by_its_prose_issue518) {
     cbm_mcp_server_t *srv = setup_prose_search_server("prose518");
     ASSERT_NOT_NULL(srv);
@@ -13445,6 +13535,8 @@ TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
 }
 
 SUITE(mcp) {
+    RUN_TEST(locate_files_is_bounded_deterministic_and_file_only);
+    RUN_TEST(locate_files_rejects_unsafe_indexed_paths);
     /* #518/#519 — BM25 prose search */
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);
     RUN_TEST(bm25_finds_module_by_promoted_description_issue519);
