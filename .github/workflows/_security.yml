@@ -23,12 +23,12 @@ jobs:
         run: scripts/security-vendored.sh
 
   license-gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install ScanCode Toolkit
-        run: pipx install scancode-toolkit
+        run: pipx install --python /usr/bin/python3.12 scancode-toolkit
       - name: "Gate self-test (a planted violation must be detected)"
         run: scripts/license-gate.sh --selftest
       - name: "License compliance gate (one finding fails)"

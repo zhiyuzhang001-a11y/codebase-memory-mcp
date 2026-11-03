@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # Matches the LLVM Noble apt repository below.
     # 15 min proved too tight on a slow runner day and a timed-out lint reads
     # as "cancelled", which the release graph must treat as a hard stop; keep
     # a bound, but one only a genuine hang can hit (normal runtime ~5 min).
@@ -37,7 +37,7 @@ jobs:
         id: cppcheck-cache
         with:
           path: /opt/cppcheck
-          key: cppcheck-2.20.0-ubuntu-amd64
+          key: cppcheck-2.20.0-ubuntu-24.04-amd64
 
       - name: Build cppcheck 2.20.0
         if: steps.cppcheck-cache.outputs.cache-hit != 'true'
@@ -60,7 +60,7 @@ jobs:
   # provability (never suppressed — the NOLINT ban applies here too).
   # Vendored-tree diagnostics are path-filtered, mirroring .cppcheck.
   lint-mem:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # Matches the LLVM Noble apt repository below.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
