@@ -1,43 +1,36 @@
-# codebase-memory-mcp
+# Codebase Memory MCP — Atlas Provider fork
 
-[![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
-[![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)
-[![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/DeusData/codebase-memory-mcp)
-[![Pure C](https://img.shields.io/badge/pure_C-no_language_runtime-blue)](https://github.com/DeusData/codebase-memory-mcp)
-[![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
-[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
-[![VirusTotal](https://img.shields.io/badge/VirusTotal-scanned_every_release-brightgreen?logo=virustotal)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
-[![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
+This repository is a fork of [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp). It carries integration changes for [Codebase Atlas](https://github.com/zhiyuzhang001-a11y/codebase-atlas), which uses Codebase Memory for structural graph evidence.
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a native executable with a small verified runtime-asset set for macOS, Linux, and Windows — download, run `install`, done.
+The upstream project parses local source with Tree-sitter, stores relationships
+in a graph, and exposes queries through MCP, a native CLI, and a local graph
+viewer. [Upstream releases](https://github.com/DeusData/codebase-memory-mcp/releases/latest) and the [upstream research preprint](https://arxiv.org/abs/2603.27277)
+document the upstream builds, platform coverage and measurements.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 162 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No language runtime, hosted service, or API key. Plug and play across 45 supported automatic/conditional client surfaces.
+## Changes carried by this fork
 
-> **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
+- [Scope index workers to the request root](https://github.com/zhiyuzhang001-a11y/codebase-memory-mcp/commit/f7406238c0c9efaf60d886ae7bf3acde071b8595).
+- [Add bounded two-pass indexing](https://github.com/zhiyuzhang001-a11y/codebase-memory-mcp/commit/dd3f4e8403ef0ba9007951d4a69823412941a72f)
+  and [memory-aware scheduling](https://github.com/zhiyuzhang001-a11y/codebase-memory-mcp/commit/1e15c63591fee6239637c9eacbaa568fe72a9f74).
+- [Add the bounded `locate_files` MCP tool](https://github.com/zhiyuzhang001-a11y/codebase-memory-mcp/commit/e088a41b8e7619fb532afda0d611b944002cfebf)
+  and integrate the result into [Atlas's managed Provider](https://github.com/zhiyuzhang001-a11y/codebase-memory-mcp/commit/f9c393f0fda2924177c23c774468ca92638fbc82).
 
-> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp). For each release product, three behaviourally identical executable candidates (unstripped, debug-stripped, stripped) are submitted to VirusTotal before testing; the selected candidate is then packaged with its SHA-256 unchanged. Release notes link every measured candidate result. Publication permits only the narrowly documented single-Microsoft `!ml` tolerance in [SECURITY.md](SECURITY.md#our-release-policy). All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
+[Inspect the pinned fork delta](https://github.com/zhiyuzhang001-a11y/codebase-memory-mcp/compare/3de05cd607f72889e89908852b1877fb08c942c1...f9c393f0fda2924177c23c774468ca92638fbc82)
+from the common upstream ancestor to the Atlas integration snapshot. The
+[existing upstream graph capture](https://github.com/DeusData/codebase-memory-mcp/blob/3de05cd607f72889e89908852b1877fb08c942c1/docs/graph-ui-screenshot.png)
+illustrates the inherited viewer. The fork delta is source-history evidence.
+Benchmark and release claims in the upstream reference below describe upstream
+work.
 
-<p align="center">
-  <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
-  <br>
-  <em>Built-in 3D graph visualization — explore your knowledge graph at localhost:9749</em>
-</p>
+## Choose an installation path
 
-## Why codebase-memory-mcp
+For Atlas, follow the [Atlas deployment rules](https://github.com/zhiyuzhang001-a11y/codebase-atlas/blob/main/docs/CODEX_DEPLOYMENT_RULES.md)
+so Atlas can manage its pinned Provider. For standalone Codebase Memory, use the
+[upstream release documentation](https://github.com/DeusData/codebase-memory-mcp#quick-start).
+The standalone commands below fetch upstream artifacts. The source remains
+under the [MIT license](LICENSE).
 
-- **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.
-- **Plug and play** — native executable plus authenticated release-owned assets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). The native install needs no Docker, language runtime, or API keys. Download → `install` → restart agent → done.
-- **162 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
-- **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
-- **45 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
-- **Built-in graph visualization** — 3D interactive UI at `localhost:9749`, served from the binary itself.
-- **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+## Upstream usage reference
 
 ## Quick Start
 
